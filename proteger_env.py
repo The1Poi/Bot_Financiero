@@ -245,6 +245,11 @@ if __name__ == "__main__":
 
     if args.unlock:
         guardar_clave_equipo_en_dpapi(args.passphrase)
+        if not ENV_PATH.exists():
+            example_path = BASE_DIR / ".env.example"
+            if example_path.exists():
+                ENV_PATH.write_text(example_path.read_text(encoding="utf-8"), encoding="utf-8")
+                print("[OK] Archivo .env creado automáticamente a partir de .env.example.")
         if ENV_PATH.exists():
             verificar_estado()
     elif args.rotate:
