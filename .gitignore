@@ -1,5 +1,11 @@
-# Credenciales y variables de entorno (RNF03)
+# Credenciales, variables de entorno y llaves criptográficas (RNF03)
 .env
+.env.*
+!.env.example
+.env.keys
+*.key
+*.pem
+*.enc
 
 # Bases de datos locales SQLite
 *.db
