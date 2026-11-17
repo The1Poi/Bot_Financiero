@@ -10,7 +10,9 @@ from src.afd import ControladorAFD
 from src.config import TELEGRAM_BOT_TOKEN, validar_configuracion
 from src.database import BaseDatosGastos
 from src.informacion import generar_mensaje_informacion
+from src.seguridad import ProtectorAntiBot
 from src.validador import (
+    MAX_CONCEPT_LENGTH,
     clasificar_entrada,
     formatear_centavos_a_moneda,
     validar_concepto,
@@ -29,12 +31,18 @@ COMANDOS_MENU_TELEGRAM = [
 class TelegramBotCliente:
     """Cliente HTTP de Long Polling conectado al Autómata Finito Determinista (AFD)."""
 
-    def __init__(self, token: str, db: BaseDatosGastos | None = None) -> None:
+    def __init__(
+        self,
+        token: str,
+        db: BaseDatosGastos | None = None,
+        protector: ProtectorAntiBot | None = None,
+    ) -> None:
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.session = requests.Session()
         self.offset = 0
         self.afd = ControladorAFD()
         self.db = db if db is not None else BaseDatosGastos()
+        self.protector = protector if protector is not None else ProtectorAntiBot()
 
     def verificar_conexion(self) -> dict:
         """Comprueba que el token sea válido consultando el método getMe."""
@@ -75,10 +83,21 @@ class TelegramBotCliente:
         data = resp.json()
         return data.get("result", [])
 
-    def enviar_mensaje(self, chat_id: int, texto: str) -> None:
-        """Envía un mensaje de texto al chat indicado (sendMessage)."""
+    def enviar_mensaje(self, chat_id: int, texto: str, reintentos: int = 2) -> None:
+        """
+        Envía un mensaje de texto al chat indicado (sendMessage).
+        Incluye protección Outbound contra HTTP 429 (Too Many Requests / Retry-After).
+        """
         payload = {"chat_id": chat_id, "text": texto}
         resp = self.session.post(f"{self.base_url}/sendMessage", json=payload, timeout=10)
+        if resp.status_code == 429 and reintentos > 0:
+            try:
+                retry_after = int(resp.json().get("parameters", {}).get("retry_after", 2))
+            except ValueError:
+                retry_after = 2
+            time.sleep(min(retry_after, 10))
+            self.enviar_mensaje(chat_id, texto, reintentos=reintentos - 1)
+            return
         resp.raise_for_status()
 
     def manejar_entrada_usuario(
@@ -170,6 +189,12 @@ class TelegramBotCliente:
                 )
             if simbolo == "ti":
                 self.afd.aplicar_transicion(id_usuario, "ti")
+                limpio_espacios = " ".join(limpio.split())
+                if len(limpio_espacios) > MAX_CONCEPT_LENGTH:
+                    return (
+                        f"❌ Error: El concepto no puede superar los {MAX_CONCEPT_LENGTH} caracteres "
+                        f"(enviaste {len(limpio_espacios)}). Por favor escribe un detalle más corto:"
+                    )
                 # Texto exacto de la Fig. 6 (RF07, RNF04)
                 return "❌ Error: El concepto no puede estar vacío. Por favor escribe un detalle válido:"
             if simbolo == "tv":
@@ -215,7 +240,15 @@ class TelegramBotCliente:
         return "⚠️ Estado no reconocido."
 
     def procesar_mensaje(self, mensaje: dict) -> None:
-        """Extrae metadatos del mensaje de Telegram, ejecuta el AFD y envía la respuesta."""
+        """
+        Aplica la capa de seguridad anti-bot/anti-flood, ejecuta el AFD y envía la respuesta.
+        """
+        # 1. Filtro de mensajes sin respuesta (otros bots, grupos, stickers/audios sin texto)
+        procesable, motivo = self.protector.es_mensaje_procesable(mensaje)
+        if not procesable:
+            print(f"[SEGURIDAD] Mensaje descartado silenciosamente ({motivo}).")
+            return
+
         chat = mensaje.get("chat", {})
         chat_id = chat.get("id")
         remitente = mensaje.get("from", {})
@@ -230,13 +263,27 @@ class TelegramBotCliente:
         if not chat_id or not id_usuario or not texto:
             return
 
+        # 2. Control de tasa de envío (anti-flood) y límite de tamaño del payload
+        permitido, advertencia = self.protector.verificar_rate_limit_y_tamano(id_usuario, texto)
+        if not permitido:
+            if advertencia:
+                self.enviar_mensaje(chat_id, advertencia)
+            print(f"[SEGURIDAD] Bloqueo temporal aplicado a @{nombre_usuario} (id={id_usuario}).")
+            return
+
         estado_previo = self.afd.obtener_estado(id_usuario)
         respuesta = self.manejar_entrada_usuario(id_usuario, nombre_usuario, texto)
         estado_posterior = self.afd.obtener_estado(id_usuario)
 
+        # 3. Detección de repetición abusiva del mismo fallo consecutivo
+        es_error = respuesta.startswith("❌") or respuesta.startswith("⚠️")
+        aviso_loop = self.protector.registrar_resultado_afd(id_usuario, es_error, texto)
+        if aviso_loop:
+            respuesta = f"{respuesta}\n\n{aviso_loop}"
+
         self.enviar_mensaje(chat_id, respuesta)
         print(
-            f"[AFD] @{nombre_usuario} (id={id_usuario}) | '{texto}' | {estado_previo} -> {estado_posterior}"
+            f"[AFD] @{nombre_usuario} (id={id_usuario}) | '{texto[:40]}' | {estado_previo} -> {estado_posterior}"
         )
 
     def iniciar_polling(self) -> None:

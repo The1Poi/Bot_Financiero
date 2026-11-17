@@ -10,6 +10,9 @@ from decimal import Decimal, InvalidOperation
 # Expresión regular sintáctica para montos positivos con hasta 2 decimales (ej. 15500 o 15500.50)
 REGEX_MONTO = re.compile(r"^\d+(\.\d{1,2})?$")
 
+# Límite máximo de caracteres permitido para el concepto de un gasto
+MAX_CONCEPT_LENGTH = 150
+
 # Expresión regular para detectar preguntas o consultas fuera de secuencia (ej. Fig. 7: "¿Cuáles son mis reportes del mes?")
 REGEX_CONSULTA_FUERA_SECUENCIA = re.compile(
     r"(^/.*)|([¿?])|\b(reportes?|estad[ií]sticas?|ayuda|informaci[oó]n|saldo|consultar|cu[aá]les|cu[aá]nto)\b",
@@ -70,8 +73,8 @@ def validar_concepto(texto: str) -> tuple[bool, str]:
     if not any(ch.isalnum() for ch in limpio):
         return False, ""
 
-    # Longitud razonable para descripción de gasto
-    if len(limpio) > 200:
+    # Límite estricto de 150 caracteres para evitar saturación en concepto
+    if len(limpio) > MAX_CONCEPT_LENGTH:
         return False, ""
 
     return True, limpio

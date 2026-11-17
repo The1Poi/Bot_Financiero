@@ -13,7 +13,9 @@ import pytest
 from src.afd import ALFABETO_SIGMA, ESTADOS_Q, MATRIZ_TRANSICIONES, ControladorAFD
 from src.bot_telegram import TelegramBotCliente
 from src.database import BaseDatosGastos
+from src.seguridad import ProtectorAntiBot
 from src.validador import (
+    MAX_CONCEPT_LENGTH,
     clasificar_entrada,
     formatear_centavos_a_moneda,
     validar_concepto,
@@ -66,11 +68,67 @@ def test_rf03_rf04_rechazo_montos_invalidos(monto_invalido: str):
 
 
 def test_rf06_rf07_validacion_concepto():
-    """RF06 / RF07 / Fig. 6: Verifica aceptación de conceptos válidos y rechazo de vacíos o '- - -'."""
+    """RF06 / RF07 / Fig. 6: Verifica aceptación de conceptos válidos, rechazo de vacíos/- - - y límite de 150 chars."""
     assert validar_concepto("Almuerzo ejecutivo") == (True, "Almuerzo ejecutivo")
     assert validar_concepto("") == (False, "")
     assert validar_concepto("    ") == (False, "")
     assert validar_concepto("- - -") == (False, "")
+    assert MAX_CONCEPT_LENGTH == 150
+    concepto_150 = "a" * 150
+    concepto_151 = "a" * 151
+    assert validar_concepto(concepto_150) == (True, concepto_150)
+    assert validar_concepto(concepto_151) == (False, "")
+
+
+def test_limite_150_caracteres_en_flujo_s2(tmp_path: Path):
+    """Verifica que enviar >150 caracteres en S2 muestre error específico sin perder el monto temporal."""
+    db_test = BaseDatosGastos(db_path=tmp_path / "limite_gastos.db")
+    bot = TelegramBotCliente(token="TOKEN_PRUEBA", db=db_test)
+    uid = 555
+
+    bot.manejar_entrada_usuario(uid, "user_lim", "/gasto")
+    bot.manejar_entrada_usuario(uid, "user_lim", "12000")
+    r_largo = bot.manejar_entrada_usuario(uid, "user_lim", "x" * 160)
+    assert "no puede superar los 150 caracteres" in r_largo
+    assert bot.afd.obtener_estado(uid) == "S2"
+    assert bot.afd.obtener_sesion(uid).monto_centavos == 1200000
+
+
+def test_capa_seguridad_antibot_y_antiflood():
+    """Verifica filtros de bots/grupos, payloads gigantes, anti-flood y bloqueo por fallos repetidos."""
+    protector = ProtectorAntiBot(
+        max_mensajes=5,
+        ventana_seg=10.0,
+        cooldown_flood_seg=30.0,
+        max_fallos_repetidos=4,
+        cooldown_fallo_seg=20.0,
+        max_raw_chars=500,
+    )
+
+    # 1. Mensajes que no deben tener respuesta (otros bots, grupos, sin texto)
+    assert protector.es_mensaje_procesable({"from": {"is_bot": True}, "chat": {"type": "private"}, "text": "hi"})[0] is False
+    assert protector.es_mensaje_procesable({"from": {"is_bot": False}, "chat": {"type": "group"}, "text": "hi"})[0] is False
+    assert protector.es_mensaje_procesable({"from": {"is_bot": False}, "chat": {"type": "private"}})[0] is False
+
+    # 2. Payload gigante (1 millón de caracteres)
+    permitido_gigante, aviso_gigante = protector.verificar_rate_limit_y_tamano(100, "A" * 1_000_000, ahora=100.0)
+    assert permitido_gigante is False
+    assert "Mensaje demasiado largo" in (aviso_gigante or "")
+
+    # 3. Anti-flood (6 mensajes en < 10s -> bloquea el 6to con 1 aviso y silencia el 7mo)
+    for i in range(5):
+        ok, _ = protector.verificar_rate_limit_y_tamano(200, "hola", ahora=1000.0 + i)
+        assert ok is True
+    ok6, aviso6 = protector.verificar_rate_limit_y_tamano(200, "hola", ahora=1005.0)
+    assert ok6 is False and aviso6 is not None
+    ok7, aviso7 = protector.verificar_rate_limit_y_tamano(200, "hola", ahora=1006.0)
+    assert ok7 is False and aviso7 is None  # Descartado en silencio
+
+    # 4. Repetir el mismo fallo 4 veces seguidas activa enfriamiento
+    for _ in range(3):
+        assert protector.registrar_resultado_afd(300, True, "abc", ahora=2000.0) is None
+    aviso_loop = protector.registrar_resultado_afd(300, True, "abc", ahora=2001.0)
+    assert aviso_loop is not None and "repetido el mismo fallo 4 veces" in aviso_loop
 
 
 def test_flujo_completo_mockups_fig5_fig6_fig7(tmp_path: Path):
